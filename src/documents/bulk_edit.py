@@ -209,6 +209,9 @@ def modify_custom_fields(
 ) -> Literal["OK"]:
     qs = Document.objects.filter(id__in=doc_ids).only("pk")
     affected_docs = list(qs.values_list("pk", flat=True))
+
+    # affected_docs is the list of docs that need to be changed
+
     # Ensure add_custom_fields is a list of tuples, supports old API
     add_custom_fields = (
         add_custom_fields.items()
@@ -216,34 +219,70 @@ def modify_custom_fields(
         else [(field, None) for field in add_custom_fields]
     )
 
+    
+    # add_custom_fields is either a list of tuples while remove_custom_fields
+    # is a list of ids
+
+    add_custom_fields_ids = set([x for x, _ in add_custom_fields])
+    if add_custom_fields_ids.intersection(set(remove_custom_fields)):
+        logger.error(f"Error: trying to add {add_custom_fields_ids} and remove {remove_custom_fields}")
+        return "ERROR"
+
+    
     custom_fields = CustomField.objects.filter(
         id__in=[int(field) for field, _ in add_custom_fields],
     ).distinct()
+
+    to_create = []
+
+    changed_columns = set()
+    # For each custom field to add, update or create instances for all affected docs
     for field_id, value in add_custom_fields:
+        try:
+            custom_field = custom_fields.get(id=field_id)
+        except CustomField.DoesNotExist:
+            logger.warning(
+                f"CustomField {field_id} does not exist, skipping bulk add",
+            )
+            continue
+
         for doc_id in affected_docs:
             defaults = {}
-            custom_field = custom_fields.get(id=field_id)
-            if custom_field:
-                value_field = CustomFieldInstance.TYPE_TO_DATA_STORE_NAME_MAP[
-                    custom_field.data_type
-                ]
-                defaults[value_field] = value
-                if (
-                    custom_field.data_type == CustomField.FieldDataType.DOCUMENTLINK
-                    and value
-                    and doc_id in value
-                ):
-                    # Prevent self-linking
-                    continue
-            CustomFieldInstance.objects.update_or_create(
-                document_id=doc_id,
-                field_id=field_id,
-                defaults=defaults,
-            )
+            value_field = CustomFieldInstance.TYPE_TO_DATA_STORE_NAME_MAP[
+                custom_field.data_type
+            ]
+            changed_columns.add(value_field)
+            defaults[value_field] = value
+
+            if (
+                custom_field.data_type == CustomField.FieldDataType.DOCUMENTLINK
+                and value
+                and doc_id in value
+            ):
+                # Prevent self-linking
+                continue
+
+            x = CustomFieldInstance(document_id=doc_id,
+                                    field_id=field_id,
+                                    **defaults)
+            
+            to_create.append(x)
+            # CustomFieldInstance.objects.update_or_create(
+            #     document_id=doc_id,
+            #     field_id=field_id,
+            #     defaults=defaults,
+            # )
+
             if custom_field.data_type == CustomField.FieldDataType.DOCUMENTLINK:
                 doc = Document.objects.get(id=doc_id)
                 reflect_doclinks(doc, custom_field, value)
 
+    CustomFieldInstance.objects.bulk_create(to_create,
+                                            update_conflicts=True,
+                                            unique_fields=["document_id", "field_id"],
+                                            update_fields=changed_columns)
+                                            
+                                        
     # For doc link fields that are being removed, remove symmetrical links
     for doclink_being_removed_instance in CustomFieldInstance.objects.filter(
         document_id__in=affected_docs,
