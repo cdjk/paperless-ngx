@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -209,6 +210,9 @@ def modify_custom_fields(
 ) -> Literal["OK"]:
     qs = Document.objects.filter(id__in=doc_ids).only("pk")
     affected_docs = list(qs.values_list("pk", flat=True))
+
+    # affected_docs is the list of docs that need to be changed
+
     # Ensure add_custom_fields is a list of tuples, supports old API
     add_custom_fields = (
         add_custom_fields.items()
@@ -216,33 +220,98 @@ def modify_custom_fields(
         else [(field, None) for field in add_custom_fields]
     )
 
+    # add_custom_fields is either a list of tuples while remove_custom_fields
+    # is a list of ids
+
+    add_custom_fields_ids = set([x for x, _ in add_custom_fields])
+    if add_custom_fields_ids.intersection(set(remove_custom_fields)):
+        logger.error(
+            f"Error: trying to add {add_custom_fields_ids} and remove {remove_custom_fields}",
+        )
+        return "ERROR"
+
     custom_fields = CustomField.objects.filter(
         id__in=[int(field) for field, _ in add_custom_fields],
     ).distinct()
+
+    to_create = []
+    doclink_operations = []  # Collect doclink ops to batch later
+
+    changed_columns = set()
+    # For each custom field to add, update or create instances for all affected docs
     for field_id, value in add_custom_fields:
+        try:
+            custom_field = custom_fields.get(id=field_id)
+        except CustomField.DoesNotExist:
+            logger.warning(
+                f"CustomField {field_id} does not exist, skipping bulk add",
+            )
+            continue
+
         for doc_id in affected_docs:
             defaults = {}
-            custom_field = custom_fields.get(id=field_id)
-            if custom_field:
-                value_field = CustomFieldInstance.TYPE_TO_DATA_STORE_NAME_MAP[
-                    custom_field.data_type
-                ]
-                defaults[value_field] = value
-                if (
-                    custom_field.data_type == CustomField.FieldDataType.DOCUMENTLINK
-                    and value
-                    and doc_id in value
-                ):
-                    # Prevent self-linking
-                    continue
-            CustomFieldInstance.objects.update_or_create(
-                document_id=doc_id,
-                field_id=field_id,
-                defaults=defaults,
-            )
+            value_field = CustomFieldInstance.TYPE_TO_DATA_STORE_NAME_MAP[
+                custom_field.data_type
+            ]
+            changed_columns.add(value_field)
+            defaults[value_field] = value
+
+            if (
+                custom_field.data_type == CustomField.FieldDataType.DOCUMENTLINK
+                and value
+                and doc_id in value
+            ):
+                # Prevent self-linking
+                continue
+
+            x = CustomFieldInstance(document_id=doc_id, field_id=field_id, **defaults)
+
+            to_create.append(x)
+
+            # Collect doclink operations for batched processing later
             if custom_field.data_type == CustomField.FieldDataType.DOCUMENTLINK:
-                doc = Document.objects.get(id=doc_id)
-                reflect_doclinks(doc, custom_field, value)
+                doclink_operations.append((doc_id, custom_field, value))
+
+    # Process all doclink reflections in bulk BEFORE modifying source instances
+    # (so we can see the old values to calculate what changed)
+    if doclink_operations:
+        bulk_reflect_doclinks(doclink_operations)
+
+    # Two-step upsert approach for MySQL/MariaDB compatibility
+    # (bulk_create with update_conflicts=True doesn't work on MySQL)
+
+    # Step 1: Insert new records (ignore existing ones)
+    CustomFieldInstance.objects.bulk_create(
+        to_create,
+        ignore_conflicts=True,
+    )
+
+    # Step 2: Update existing records
+    if to_create and changed_columns:
+        # Get existing instances that need updating
+        existing_instances = CustomFieldInstance.objects.filter(
+            document_id__in=[x.document_id for x in to_create],
+            field_id__in=[x.field_id for x in to_create],
+        )
+
+        # Build a lookup for new values
+        new_values = {(x.document_id, x.field_id): x for x in to_create}
+
+        # Update existing instances with new values
+        instances_to_update = []
+        for instance in existing_instances:
+            key = (instance.document_id, instance.field_id)
+            if key in new_values:
+                new_obj = new_values[key]
+                for col in changed_columns:
+                    setattr(instance, col, getattr(new_obj, col))
+                instances_to_update.append(instance)
+
+        if instances_to_update:
+            CustomFieldInstance.objects.bulk_update(
+                instances_to_update,
+                list(changed_columns),
+            )
 
     # For doc link fields that are being removed, remove symmetrical links
     for doclink_being_removed_instance in CustomFieldInstance.objects.filter(
@@ -642,6 +711,130 @@ def edit_pdf(
         ) from e
 
     return "OK"
+
+
+def bulk_reflect_doclinks(
+    operations: list[tuple[int, CustomField, list[int] | None]],
+):
+    """
+    Batch process doclink reflections for multiple documents.
+    operations: list of (source_doc_id, field, new_target_doc_ids)
+
+    This is an optimized version that batches DB queries instead of
+    processing each document individually.
+    """
+    if not operations:
+        return
+
+    # Group by field for efficiency
+    by_field: dict[int, tuple[CustomField, list[tuple[int, list[int] | None]]]] = {}
+    for doc_id, field, targets in operations:
+        if field.id not in by_field:
+            by_field[field.id] = (field, [])
+        by_field[field.id][1].append((doc_id, targets))
+
+    for field_id, (field, doc_operations) in by_field.items():
+        source_doc_ids = [doc_id for doc_id, _ in doc_operations]
+
+        # 1. Fetch ALL current instances for source docs in ONE query
+        current_instances = {
+            inst.document_id: inst
+            for inst in CustomFieldInstance.objects.filter(
+                field_id=field_id,
+                document_id__in=source_doc_ids,
+            )
+        }
+
+        # 2. Calculate all additions and removals (using lists to preserve order)
+        all_targets_to_add: dict[int, list[int]] = defaultdict(list)
+        all_targets_to_remove: dict[int, list[int]] = defaultdict(list)
+
+        for source_doc_id, new_targets in doc_operations:
+            new_targets_set = set(new_targets) if new_targets else set()
+            current_inst = current_instances.get(source_doc_id)
+            old_targets_set = (
+                set(current_inst.value)
+                if current_inst and current_inst.value
+                else set()
+            )
+
+            # Targets being added (preserve order, avoid duplicates)
+            for target in new_targets_set - old_targets_set:
+                if source_doc_id not in all_targets_to_add[target]:
+                    all_targets_to_add[target].append(source_doc_id)
+
+            # Targets being removed
+            for target in old_targets_set - new_targets_set:
+                if source_doc_id not in all_targets_to_remove[target]:
+                    all_targets_to_remove[target].append(source_doc_id)
+
+        # 3. Fetch ALL target instances in ONE query
+        all_target_ids = set(all_targets_to_add.keys()) | set(
+            all_targets_to_remove.keys(),
+        )
+        if not all_target_ids:
+            continue
+
+        target_instances = {
+            inst.document_id: inst
+            for inst in CustomFieldInstance.objects.filter(
+                field_id=field_id,
+                document_id__in=all_target_ids,
+            )
+        }
+
+        # 4. Process additions and removals
+        instances_to_create = []
+        instances_to_update = []
+        updated_instance_ids = set()
+
+        # Handle additions
+        for target_doc_id, source_ids_to_add in all_targets_to_add.items():
+            target_inst = target_instances.get(target_doc_id)
+            if target_inst is None:
+                instances_to_create.append(
+                    CustomFieldInstance(
+                        document_id=target_doc_id,
+                        field_id=field_id,
+                        value_document_ids=source_ids_to_add,  # Already a list
+                    ),
+                )
+            else:
+                current_value = list(target_inst.value) if target_inst.value else []
+                current_set = set(current_value)
+                # Append new values preserving order
+                new_value = current_value + [
+                    sid for sid in source_ids_to_add if sid not in current_set
+                ]
+                if len(new_value) != len(current_value):
+                    target_inst.value_document_ids = new_value
+                    if target_inst.id not in updated_instance_ids:
+                        instances_to_update.append(target_inst)
+                        updated_instance_ids.add(target_inst.id)
+
+        # Handle removals
+        for target_doc_id, source_ids_to_remove in all_targets_to_remove.items():
+            target_inst = target_instances.get(target_doc_id)
+            if target_inst and target_inst.value:
+                remove_set = set(source_ids_to_remove)
+                new_value = [v for v in target_inst.value if v not in remove_set]
+                if len(new_value) != len(target_inst.value):
+                    target_inst.value_document_ids = new_value
+                    if target_inst.id not in updated_instance_ids:
+                        instances_to_update.append(target_inst)
+                        updated_instance_ids.add(target_inst.id)
+
+        # 5. Bulk create and update
+        if instances_to_create:
+            CustomFieldInstance.objects.bulk_create(instances_to_create)
+        if instances_to_update:
+            CustomFieldInstance.objects.bulk_update(
+                instances_to_update,
+                ["value_document_ids"],
+            )
+
+        # 6. Update modified timestamps in bulk
+        Document.objects.filter(id__in=all_target_ids).update(modified=timezone.now())
 
 
 def reflect_doclinks(

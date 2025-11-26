@@ -343,6 +343,30 @@ class TestBulkEdit(DirectoriesMixin, TestCase):
             self.doc2.custom_fields.filter(field=cf3).first().value,
         )
 
+    def test_modify_custom_fields_error_cases(self):
+        """
+        GIVEN:
+            - 2 existing documents
+            - 1 custom field
+        WHEN:
+            - the same custom field id is passed to modify_custom_fields
+        THEN:
+            - an ERROR is returned
+        """
+        cf = CustomField.objects.create(
+            name="cf",
+            data_type=CustomField.FieldDataType.STRING,
+        )
+        with self.assertLogs("paperless.bulk_edit", level="ERROR") as cm:
+            bulk_edit.modify_custom_fields(
+                [self.doc1.id, self.doc2.id],
+                add_custom_fields=[cf.id],
+                remove_custom_fields=[cf.id],
+            )
+            error_str = cm.output[0]
+            self.assertIn("Error: trying to add", error_str)
+            self.assertIn("and remove", error_str)
+
     def test_modify_custom_fields_doclink_self_link(self):
         """
         GIVEN:
