@@ -1,0 +1,7 @@
+services:
+  webserver:
+    image: paperless-ngx:local-dev
+    volumes:
+      - /home/cdjk/paperless-data/export:/usr/src/paperless/export
+      - /home/cdjk/paperless-data/consume:/usr/src/paperless/consume
+    env_file: docker-compose.env
