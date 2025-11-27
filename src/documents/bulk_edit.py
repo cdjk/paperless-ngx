@@ -219,30 +219,44 @@ def modify_custom_fields(
     custom_fields = CustomField.objects.filter(
         id__in=[int(field) for field, _ in add_custom_fields],
     ).distinct()
+
+    to_create = []
+
+    changed_columns = set()
+    # for each custom field to add, update or create instances for all affected docs
     for field_id, value in add_custom_fields:
+        custom_field = custom_fields.get(id=field_id)
         for doc_id in affected_docs:
             defaults = {}
-            custom_field = custom_fields.get(id=field_id)
-            if custom_field:
-                value_field = CustomFieldInstance.TYPE_TO_DATA_STORE_NAME_MAP[
-                    custom_field.data_type
-                ]
-                defaults[value_field] = value
-                if (
-                    custom_field.data_type == CustomField.FieldDataType.DOCUMENTLINK
-                    and value
-                    and doc_id in value
-                ):
-                    # Prevent self-linking
-                    continue
-            CustomFieldInstance.objects.update_or_create(
-                document_id=doc_id,
-                field_id=field_id,
-                defaults=defaults,
-            )
+            value_field = CustomFieldInstance.TYPE_TO_DATA_STORE_NAME_MAP[
+                custom_field.data_type
+            ]
+            changed_columns.add(value_field)
+            defaults[value_field] = value
+
+            if (
+                custom_field.data_type == CustomField.FieldDataType.DOCUMENTLINK
+                and value
+                and doc_id in value
+            ):
+                # Prevent self-linking
+                continue
+
+            x = CustomFieldInstance(document_id=doc_id,
+                                    field_id=field_id,
+                                    **defaults)
+            
+            to_create.append(x)
+
             if custom_field.data_type == CustomField.FieldDataType.DOCUMENTLINK:
                 doc = Document.objects.get(id=doc_id)
                 reflect_doclinks(doc, custom_field, value)
+
+    CustomFieldInstance.objects.bulk_create(to_create,
+                                            update_conflicts=True,
+                                            unique_fields=["document_id", "field_id"],
+                                            update_fields=changed_columns)
+
 
     # For doc link fields that are being removed, remove symmetrical links
     for doclink_being_removed_instance in CustomFieldInstance.objects.filter(
